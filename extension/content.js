@@ -1,0 +1,3 @@
+(() => {
+  globalThis.XPipVideoPiP?.toggleLargestVideoPiP();
+})();

@@ -1,0 +1,415 @@
+#!/bin/bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+#  XPip Installer
+#  Compiles the Swift daemon, generates extension icons, and prints
+#  post-install instructions.
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DAEMON_DIR="$SCRIPT_DIR/daemon"
+EXTENSION_DIR="$SCRIPT_DIR/extension"
+SAFARI_DIR="$SCRIPT_DIR/safari"
+INSTALL_DIR="$HOME/.xpip"
+APP_BUNDLE="$INSTALL_DIR/xpip.app"
+BINARY="$APP_BUNDLE/Contents/MacOS/xpip"
+PORT=51789
+
+# ---------------------------------------------------------------------------
+#  Helpers
+# ---------------------------------------------------------------------------
+
+log()      { printf "[%s] %s\n" "$1" "$2"; }
+log_ok()   { printf "      %s\n" "$1"; }
+bail()     { printf "ERROR: %s\n" "$1" >&2; exit 1; }
+section()  { printf "\n--- %s %s\n" "$1" "$(printf '%*s' $((60 - ${#1})) '' | tr ' ' '-')"; }
+
+# ---------------------------------------------------------------------------
+#  Pre-flight checks
+# ---------------------------------------------------------------------------
+
+section "Pre-flight"
+
+SWIFT_FILES=("$DAEMON_DIR"/*.swift "$DAEMON_DIR"/Games/*.swift "$DAEMON_DIR"/Games/Arcade/*.swift "$DAEMON_DIR"/Games/Emulators/*.swift "$DAEMON_DIR"/Games/Sprites/*.swift)
+if [ ${#SWIFT_FILES[@]} -eq 0 ]; then
+    bail "No Swift source files found in $DAEMON_DIR"
+fi
+
+if ! command -v swiftc >/dev/null 2>&1; then
+    bail "swiftc not found. Install Xcode or the Command Line Tools first."
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    bail "python3 not found. Install Python 3 first."
+fi
+
+log "OK" "All prerequisites met."
+
+# ---------------------------------------------------------------------------
+#  Step 1 -- Stop any running XPip process
+# ---------------------------------------------------------------------------
+
+section "Step 1/4: Stop existing daemon"
+
+PLIST_LABEL="com.xpip.daemon"
+LEGACY_LABEL="com.pipbounce.daemon"
+PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
+LEGACY_PLIST_PATH="$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
+stopped_any=false
+
+for label in "$PLIST_LABEL" "$LEGACY_LABEL"; do
+    if launchctl list "$label" >/dev/null 2>&1; then
+        launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+        stopped_any=true
+    fi
+done
+
+for proc in xpip pipbounce; do
+    if pgrep -x "$proc" >/dev/null 2>&1; then
+        pkill -x "$proc" || true
+        stopped_any=true
+    fi
+done
+
+rm -f "$LEGACY_PLIST_PATH"
+sleep 0.5
+
+if [ "$stopped_any" = true ]; then
+    log "1/4" "Stopped existing daemon agents/processes (XPip + legacy PipBounce)."
+else
+    log "1/4" "No running XPip/PipBounce process found. Continuing."
+fi
+
+# ---------------------------------------------------------------------------
+#  Step 2 -- Compile the Swift daemon
+# ---------------------------------------------------------------------------
+
+section "Step 2/4: Compile daemon"
+
+mkdir -p "$APP_BUNDLE/Contents/MacOS"
+
+cat > "$APP_BUNDLE/Contents/Info.plist" << 'INFOPLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.xpip.daemon</string>
+    <key>CFBundleName</key>
+    <string>XPip</string>
+    <key>CFBundleExecutable</key>
+    <string>xpip</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.4</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>SFSafariWebExtensionBundleIdentifier</key>
+    <array>
+        <string>com.xpip.daemon.safari</string>
+    </array>
+</dict>
+</plist>
+INFOPLIST
+
+log "2/4" "Compiling ${#SWIFT_FILES[@]} Swift files ..."
+
+swiftc "${SWIFT_FILES[@]}" \
+    -o "$BINARY" \
+    -framework Cocoa \
+    -framework ApplicationServices \
+    -framework QuartzCore \
+    -O
+
+chmod +x "$BINARY"
+
+# ---------------------------------------------------------------------------
+#  Build Safari Web Extension (.appex) if safari/ exists
+# ---------------------------------------------------------------------------
+
+APPEX_BUNDLE="$APP_BUNDLE/Contents/PlugIns/XPipSafari.appex"
+
+if [ -d "$SAFARI_DIR" ]; then
+    log "2/4" "Building Safari Web Extension (.appex) ..."
+
+    APPEX_BINARY="$APPEX_BUNDLE/Contents/MacOS/XPipSafari"
+    APPEX_RESOURCES="$APPEX_BUNDLE/Contents/Resources"
+    mkdir -p "$APPEX_BUNDLE/Contents/MacOS" "$APPEX_RESOURCES/icons"
+
+    # Compile handler
+    swiftc "$SAFARI_DIR/SafariWebExtensionHandler.swift" \
+        -parse-as-library \
+        -module-name XPipSafari \
+        -framework Foundation \
+        -framework SafariServices \
+        -Xlinker -e -Xlinker _NSExtensionMain \
+        -o "$APPEX_BINARY" \
+        -O
+
+    chmod +x "$APPEX_BINARY"
+
+    # Copy Info.plist
+    cp "$SAFARI_DIR/Info.plist" "$APPEX_BUNDLE/Contents/Info.plist"
+
+    # Copy Safari-specific manifest
+    cp "$SAFARI_DIR/manifest.json" "$APPEX_RESOURCES/manifest.json"
+
+    # Copy shared extension files from extension/
+    for f in popup.html popup.js background.js content.js autopip.js icons.js; do
+        [ -f "$EXTENSION_DIR/$f" ] && cp "$EXTENSION_DIR/$f" "$APPEX_RESOURCES/$f"
+    done
+    if [ -d "$EXTENSION_DIR/shared" ]; then
+        mkdir -p "$APPEX_RESOURCES/shared"
+        cp "$EXTENSION_DIR/shared/"*.js "$APPEX_RESOURCES/shared/" 2>/dev/null || true
+    fi
+
+    # Copy icons (will be regenerated below and re-copied)
+    if [ -d "$EXTENSION_DIR/icons" ]; then
+        cp "$EXTENSION_DIR/icons/"*.png "$APPEX_RESOURCES/icons/" 2>/dev/null || true
+    fi
+
+    log_ok "Built $APPEX_BUNDLE"
+fi
+
+# ---------------------------------------------------------------------------
+#  Sign (inside-out: appex first, then host app)
+# ---------------------------------------------------------------------------
+
+# Check for Developer ID cert first (for distribution), then dev certs, then ad-hoc
+DEVID_SIGN=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | awk -F'"' '{print $2}' || true)
+SIGN_ID=$(security find-identity -v -p codesigning | grep -E "XPip Dev|xpip Dev|pipbounce Dev" | head -1 | awk -F'"' '{print $2}' || true)
+
+ENTITLEMENTS="$DAEMON_DIR/xpip.entitlements"
+SAFARI_ENTITLEMENTS="$SAFARI_DIR/safari.entitlements"
+
+# Sign appex first (inside-out signing)
+if [ -d "$APPEX_BUNDLE" ]; then
+    if [ -n "$DEVID_SIGN" ]; then
+        codesign --force --options runtime \
+                 --entitlements "$SAFARI_ENTITLEMENTS" \
+                 --sign "$DEVID_SIGN" "$APPEX_BUNDLE"
+    elif [ -n "$SIGN_ID" ]; then
+        codesign --force --options runtime \
+                 --entitlements "$SAFARI_ENTITLEMENTS" \
+                 --sign "$SIGN_ID" "$APPEX_BUNDLE"
+    else
+        codesign --force --entitlements "$SAFARI_ENTITLEMENTS" --sign - "$APPEX_BUNDLE"
+    fi
+    log_ok "Signed appex"
+fi
+
+# Sign host app
+if [ -n "$DEVID_SIGN" ]; then
+    codesign --force --options runtime \
+             --entitlements "$ENTITLEMENTS" \
+             --sign "$DEVID_SIGN" "$APP_BUNDLE"
+    log_ok "Signed with Developer ID (hardened runtime): $DEVID_SIGN"
+elif [ -n "$SIGN_ID" ]; then
+    codesign --force --options runtime \
+             --entitlements "$ENTITLEMENTS" \
+             --sign "$SIGN_ID" "$APP_BUNDLE"
+    log_ok "Signed with dev identity (hardened runtime): $SIGN_ID"
+else
+    codesign --force --sign - "$APP_BUNDLE"
+    log_ok "Signed ad-hoc (run install once to create stable cert)"
+fi
+
+# Optional notarization (run with NOTARIZE=1 APPLE_ID=... TEAM_ID=... APP_PASSWORD=...)
+if [ "${NOTARIZE:-0}" = "1" ]; then
+    log "2/4" "Notarizing..."
+    BUNDLE_ZIP="$INSTALL_DIR/xpip-notarize.zip"
+    ditto -c -k --keepParent "$APP_BUNDLE" "$BUNDLE_ZIP"
+    xcrun notarytool submit "$BUNDLE_ZIP" \
+        --apple-id "${APPLE_ID:?Set APPLE_ID for notarization}" \
+        --team-id "${TEAM_ID:?Set TEAM_ID for notarization}" \
+        --password "${APP_PASSWORD:?Set APP_PASSWORD for notarization}" \
+        --wait
+    xcrun stapler staple "$APP_BUNDLE"
+    rm -f "$BUNDLE_ZIP"
+    log_ok "Notarization complete and stapled."
+fi
+log_ok "Built $APP_BUNDLE"
+log_ok "Binary: $(stat -f '%Sm' -t '%Y-%m-%d %H:%M:%S' "$BINARY")"
+
+# ---------------------------------------------------------------------------
+#  Step 3 -- Generate extension icons
+# ---------------------------------------------------------------------------
+
+section "Step 3/4: Generate icons"
+
+SCRIPT_DIR="$SCRIPT_DIR" python3 - << 'PYEOF'
+import struct, zlib, os
+
+def create_icon(size):
+    pixels = []
+    pad = max(1, size // 8)
+    for y in range(size):
+        row = []
+        for x in range(size):
+            in_bg = pad <= x < size - pad and pad <= y < size - pad
+            main_r, main_b = int(size * 0.65), int(size * 0.65)
+            in_main = pad + 1 <= x <= main_r and pad + 1 <= y <= main_b
+            pip_l, pip_t = int(size * 0.55), int(size * 0.55)
+            in_pip = pip_l <= x <= size - pad - 1 and pip_t <= y <= size - pad - 1
+            arrow_cx, arrow_cy = int(size * 0.42), int(size * 0.78)
+            in_arrow = (abs(x - arrow_cx) + abs(y - arrow_cy)) <= max(2, size // 10)
+            if in_pip:
+                row.extend([100, 180, 255, 255])
+            elif in_arrow:
+                row.extend([100, 180, 255, 200])
+            elif in_main:
+                row.extend([40, 40, 50, 255])
+            elif in_bg:
+                row.extend([60, 60, 75, 255])
+            else:
+                row.extend([0, 0, 0, 0])
+        pixels.append(bytes(row))
+    def chunk(ctype, data):
+        c = ctype + data
+        return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+    sig = b'\x89PNG\r\n\x1a\n'
+    ihdr = struct.pack('>IIBBBBB', size, size, 8, 6, 0, 0, 0)
+    raw = b''
+    for r in pixels:
+        raw += b'\x00' + r
+    return sig + chunk(b'IHDR', ihdr) + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b'')
+
+icon_dir = os.path.join(os.environ.get('SCRIPT_DIR', '.'), 'extension', 'icons')
+os.makedirs(icon_dir, exist_ok=True)
+for s in [16, 48, 128]:
+    with open(os.path.join(icon_dir, f'icon{s}.png'), 'wb') as f:
+        f.write(create_icon(s))
+    print(f"      icon{s}.png")
+PYEOF
+
+# Re-copy generated icons into appex Resources
+if [ -d "$APPEX_BUNDLE" ] && [ -d "$EXTENSION_DIR/icons" ]; then
+    cp "$EXTENSION_DIR/icons/"*.png "$APPEX_BUNDLE/Contents/Resources/icons/" 2>/dev/null || true
+    log_ok "Copied icons into Safari extension"
+fi
+
+# ---------------------------------------------------------------------------
+#  Step 4 -- Install and start launchd agent
+# ---------------------------------------------------------------------------
+
+section "Step 4/4: Install launchd agent"
+
+mkdir -p "$HOME/Library/LaunchAgents"
+
+cat > "$PLIST_PATH" << PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$PLIST_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$BINARY</string>
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$INSTALL_DIR/xpip.log</string>
+    <key>StandardErrorPath</key>
+    <string>$INSTALL_DIR/xpip.log</string>
+</dict>
+</plist>
+PLISTEOF
+
+# Skip TCC reset — preserve existing Accessibility approval across reinstalls.
+# The stable code signature (or ad-hoc with same bundle ID) keeps the grant valid.
+
+launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || true
+launchctl kickstart -k "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
+
+sleep 0.5
+
+if launchctl list "$PLIST_LABEL" >/dev/null 2>&1; then
+    log "4/4" "Daemon installed and running via launchd."
+    log_ok "It will auto-start on login and restart when triggered by the extension."
+else
+    log "4/4" "Launchd agent installed. Start manually: launchctl load $PLIST_PATH"
+fi
+
+# Accessibility settings are now handled by the onboarding window on first launch.
+
+# ---------------------------------------------------------------------------
+#  Optional: Build .dmg (run with DMG=1)
+# ---------------------------------------------------------------------------
+
+if [ "${DMG:-0}" = "1" ]; then
+    section "Building .dmg"
+
+    DMG_STAGING="$INSTALL_DIR/dmg-staging"
+    rm -rf "$DMG_STAGING"
+    mkdir -p "$DMG_STAGING"
+
+    # Copy app bundle
+    cp -R "$APP_BUNDLE" "$DMG_STAGING/xpip.app"
+
+    # Copy extension
+    cp -R "$EXTENSION_DIR" "$DMG_STAGING/extension"
+
+    # Create README
+    cat > "$DMG_STAGING/README.txt" << 'READMEEOF'
+XPip — Setup Instructions
+
+1. Drag xpip.app to your preferred location (e.g. /Applications)
+   or double-click to run from here.
+
+2. On first launch, XPip will ask for Accessibility permission.
+   Follow the on-screen instructions.
+
+3. Load the Chrome extension:
+   a. Open chrome://extensions
+   b. Enable "Developer mode" (top-right toggle)
+   c. Click "Load unpacked" and select the "extension" folder
+
+The menu bar icon (XP) lets you toggle dodge/glow, launch games,
+restart, or uninstall.
+READMEEOF
+
+    DMG_PATH="$SCRIPT_DIR/XPip.dmg"
+    rm -f "$DMG_PATH"
+    hdiutil create -volname "XPip" \
+        -srcfolder "$DMG_STAGING" \
+        -ov -format UDZO \
+        "$DMG_PATH"
+    rm -rf "$DMG_STAGING"
+    log_ok "Built $DMG_PATH"
+fi
+
+# ---------------------------------------------------------------------------
+#  Done -- print setup instructions
+# ---------------------------------------------------------------------------
+
+printf "\n"
+printf "===================================================================\n"
+printf "  Installation complete. Daemon is running.\n"
+printf "===================================================================\n"
+printf "\n"
+printf "NEXT STEPS\n"
+printf "\n"
+printf "  1. Grant Accessibility permission (if not already done)\n"
+printf "     The onboarding window will guide you on first launch,\n"
+printf "     or: System Settings -> Privacy & Security -> Accessibility\n"
+printf "     Click \"+\" and add:  %s\n" "$APP_BUNDLE"
+printf "\n"
+printf "  2. Load the Chrome extension\n"
+printf "     a. Open  chrome://extensions\n"
+printf "     b. Enable \"Developer mode\" (top-right toggle)\n"
+printf "     c. Click \"Load unpacked\" and select:\n"
+printf "        %s\n" "$EXTENSION_DIR"
+printf "\n"
+printf "  The menu bar icon lets you control XPip.\n"
+printf "  Logs: %s/xpip.log\n" "$INSTALL_DIR"
+printf "\n"
